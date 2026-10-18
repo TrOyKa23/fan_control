@@ -9,6 +9,7 @@ embassy-time         = { version = "0.5", features = ["defmt", "defmt-timestamp-
 embassy-rp           = { version = "0.10", features = ["defmt", "rp235xa", "time-driver", "critical-section-impl", "binary-info"] }
 embassy-sync         = "0.8"
 embassy-embedded-hal = "0.6"
+one-wire-bus = "0.1"
 
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
