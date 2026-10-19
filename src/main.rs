@@ -3,6 +3,8 @@
 
 mod ds18b20;
 mod fan;
+mod network;
+mod state;
 
 use defmt::*;
 use defmt_rtt as _;
@@ -14,7 +16,6 @@ use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_time::{Duration, Instant, Timer};
 
-/// Асинхронная задача мониторинга оборотов вентилятора (TACH на PIN_18)
 #[embassy_executor::task]
 async fn tach_monitor_task(mut tach_pin: Input<'static>) {
     loop {
@@ -31,14 +32,12 @@ async fn tach_monitor_task(mut tach_pin: Input<'static>) {
                 Ok(_) => {
                     pulse_count += 1;
                 }
-                Err(_) => {
-                    // Таймаут среза 100мс для проверки общего времени секунды
-                }
+                Err(_) => {}
             }
         }
 
-        // 2 импульса на 1 полный оборот вентилятора -> RPM = (импульсы * 60) / 2 = импульсы * 30
         let rpm = pulse_count * 30;
+        crate::state::set_rpm(rpm);
         info!("Скорость вентилятора: {} RPM", rpm);
     }
 }
@@ -48,18 +47,23 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     info!("Супервизор TPA3255 запущен!");
 
-    let btn_power = Input::new(p.PIN_2, Pull::Up); // GP2
-    let fault_bus = Input::new(p.PIN_7, Pull::Up); // GP7
-    let tach_pin = Input::new(p.PIN_19, Pull::Up); // GP19 - Тахометр вентилятора (TACH)
+    let btn_power = Input::new(p.PIN_2, Pull::Up);
+    let fault_bus = Input::new(p.PIN_7, Pull::Up);
+    let tach_pin = Input::new(p.PIN_19, Pull::Up);
 
-    // Запуск фоновой задачи измерения RPM
+    // .unwrap() внутри: извлекаем SpawnToken
     spawner.spawn(tach_monitor_task(tach_pin).unwrap());
 
-    let mut led_power = Output::new(p.PIN_3, Level::Low); // GP3
-    let mut led_fault = Output::new(p.PIN_4, Level::Low); // GP4
-    let mut en_5v_main = Output::new(p.PIN_5, Level::Low); // GP5
-    let mut relay_en = Output::new(p.PIN_6, Level::Low); // GP6
-    let mut fan_en = Output::new(p.PIN_16, Level::Low); // GP16
+    // Передаем p.PIN_25 (WL_CS на Pico W)
+    network::spawn_network_task(
+        &spawner, p.PIN_23, p.PIO0, p.PIN_24, p.PIN_29, p.DMA_CH0, p.PIN_25,
+    );
+
+    let mut led_power = Output::new(p.PIN_3, Level::Low);
+    let mut led_fault = Output::new(p.PIN_4, Level::Low);
+    let mut en_5v_main = Output::new(p.PIN_5, Level::Low);
+    let mut relay_en = Output::new(p.PIN_6, Level::Low);
+    let mut fan_en = Output::new(p.PIN_16, Level::Low);
 
     let mut pwm_config = PwmConfig::default();
     pwm_config.top = 5999;
@@ -83,7 +87,7 @@ async fn main(spawner: Spawner) {
     loop {
         if sensor_count > 0 {
             if ow_bus.reset() {
-                ow_bus.write_byte(0xCC); // Skip ROM
+                ow_bus.write_byte(0xCC);
                 ow_bus.write_byte(0x44);
                 Timer::after(Duration::from_millis(750)).await;
 
@@ -101,6 +105,8 @@ async fn main(spawner: Spawner) {
                         let temp_deci = (raw_temp * 10) / 16;
                         info!("Д{}: {}.{}°C", i + 1, temp_deci / 10, temp_deci % 10);
 
+                        crate::state::set_temp(i, temp_deci);
+
                         if temp_deci > current_max {
                             current_max = temp_deci;
                         }
@@ -109,6 +115,7 @@ async fn main(spawner: Spawner) {
 
                 if current_max > -500 {
                     max_temp_deci_c = current_max;
+                    crate::state::set_temp(0, max_temp_deci_c);
                 }
             }
         }
@@ -134,6 +141,7 @@ async fn main(spawner: Spawner) {
             Timer::after(Duration::from_millis(50)).await;
             if btn_power.is_low() {
                 system_active = !system_active;
+                crate::state::set_system_active(system_active);
 
                 if system_active {
                     info!("Включение системы...");
