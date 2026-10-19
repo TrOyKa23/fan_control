@@ -29,8 +29,9 @@ struct Aligned<T: ?Sized>(T);
 
 static FW_DATA: Aligned<[u8; include_bytes!("firmware/43439A0.bin").len()]> =
     Aligned(*include_bytes!("firmware/43439A0.bin"));
-// Стандартная строка NVRAM для Pico W / Pico 2 W с авто-подсчетом длины
-const NVRAM_BYTES: &[u8; 289] = b"NVRAMRev=$Rev: 7.95.49.00 $\0\
+
+// Стандартный шаблон NVRAM-строки без фиксированного MAC-адреса
+const NVRAM_TEMPLATE: &[u8] = b"NVRAMRev=$Rev: 7.95.49.00 $\0\
 manfid=0x2d0\0\
 prodid=0x0727\0\
 vendid=0x14e4\0\
@@ -51,8 +52,6 @@ extpagain2g=0\0\
 pa2gw3a=0x0000\0\
 radv=0\0\0";
 
-static NVRAM_DATA: Aligned<[u8; NVRAM_BYTES.len()]> = Aligned(*NVRAM_BYTES);
-
 pub fn spawn_network_task(
     spawner: &Spawner,
     pwr: Peri<'static, PIN_23>,
@@ -70,48 +69,85 @@ async fn wifi_stack_task(
     spawner: Spawner,
     pwr_pin: Peri<'static, PIN_23>,
     pio_periph: Peri<'static, PIO0>,
-    dio: Peri<'static, PIN_24>,
-    clk: Peri<'static, PIN_29>,
-    dma: Peri<'static, DMA_CH0>,
+    dio_pin: Peri<'static, PIN_24>,
+    clk_pin: Peri<'static, PIN_29>,
+    dma_ch_periph: Peri<'static, DMA_CH0>,
     cs_pin: Peri<'static, PIN_25>,
 ) {
     let pwr = Output::new(pwr_pin, Level::Low);
     let cs = Output::new(cs_pin, Level::High);
     let mut pio = Pio::new(pio_periph, Irqs);
-    let dma_ch = embassy_rp::dma::Channel::new(dma, Irqs);
+    let dma_ch = embassy_rp::dma::Channel::new(dma_ch_periph, Irqs);
 
-    // Делитель RM2 специально для Pico 2 W
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
         cyw43_pio::RM2_CLOCK_DIVIDER,
         pio.irq0,
         cs,
-        dio,
-        clk,
+        dio_pin,
+        clk_pin,
         dma_ch,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
 
+    let seed = embassy_time::Instant::now().as_micros();
+    let mac_bytes: [u8; 6] = [
+        0x02,
+        ((seed >> 8) & 0xFF) as u8,
+        ((seed >> 16) & 0xFF) as u8,
+        ((seed >> 24) & 0xFF) as u8,
+        ((seed >> 32) & 0xFF) as u8,
+        (seed & 0xFF) as u8,
+    ];
+
+    let mut nvram_buf = [0u8; 289];
+    nvram_buf.copy_from_slice(NVRAM_TEMPLATE);
+
+    if let Some(pos) = nvram_buf.windows(8).position(|w| w == b"macaddr=") {
+        let start = pos + 8;
+        let mut mac_str = [0u8; 17];
+        let hex_chars = b"0123456789abcdef";
+
+        for (i, &b) in mac_bytes.iter().enumerate() {
+            let idx = i * 3;
+            mac_str[idx] = hex_chars[(b >> 4) as usize];
+            mac_str[idx + 1] = hex_chars[(b & 0x0f) as usize];
+            if i < 5 {
+                mac_str[idx + 2] = b':';
+            }
+        }
+
+        nvram_buf[start..start + 17].copy_from_slice(&mac_str);
+    }
+
+    static NVRAM_DATA_CELL: StaticCell<Aligned<[u8; 289]>> = StaticCell::new();
+    let nvram_data = NVRAM_DATA_CELL.init(Aligned(nvram_buf));
+
+    static CLM_DATA: Aligned<[u8; include_bytes!("firmware/43439A0_clm.bin").len()]> =
+        Aligned(*include_bytes!("firmware/43439A0_clm.bin"));
+
     let fw: &'static cyw43::Aligned<cyw43::A4, [u8]> = unsafe {
         &*(FW_DATA.0.as_slice() as *const [u8] as *const cyw43::Aligned<cyw43::A4, [u8]>)
     };
     let nvram: &'static cyw43::Aligned<cyw43::A4, [u8]> = unsafe {
-        &*(NVRAM_DATA.0.as_slice() as *const [u8] as *const cyw43::Aligned<cyw43::A4, [u8]>)
+        &*(nvram_data.0.as_slice() as *const [u8] as *const cyw43::Aligned<cyw43::A4, [u8]>)
+    };
+    let clm: &'static cyw43::Aligned<cyw43::A4, [u8]> = unsafe {
+        &*(CLM_DATA.0.as_slice() as *const [u8] as *const cyw43::Aligned<cyw43::A4, [u8]>)
     };
 
-    // Передаем fw и nvram
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
 
     spawner.spawn(cyw43_task(runner).unwrap());
 
+    control.init(clm).await;
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    // ВНИМАНИЕ: укажите данные вашей Wi-Fi сети
     let ssid = "DIGI-nEh3";
     let password = "hxmsznr3Tp";
 
@@ -120,10 +156,10 @@ async fn wifi_stack_task(
     static STACK_RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
     let resources = STACK_RESOURCES.init(StackResources::new());
 
-    let seed = 0x0123_4567_89ab_cdef;
+    let net_seed = 0x0123_4567_89ab_cdef;
     let config = embassy_net::Config::dhcpv4(Default::default());
 
-    let (stack, runner) = embassy_net::new(net_device, config, resources, seed);
+    let (stack, runner) = embassy_net::new(net_device, config, resources, net_seed);
 
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(http_server_task(stack).unwrap());
