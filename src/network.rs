@@ -30,7 +30,10 @@ struct Aligned<T: ?Sized>(T);
 static FW_DATA: Aligned<[u8; include_bytes!("firmware/43439A0.bin").len()]> =
     Aligned(*include_bytes!("firmware/43439A0.bin"));
 
-// Стандартный шаблон NVRAM-строки без фиксированного MAC-адреса
+static CLM_DATA: Aligned<[u8; include_bytes!("firmware/43439A0_clm.bin").len()]> =
+    Aligned(*include_bytes!("firmware/43439A0_clm.bin"));
+
+// Стандартный шаблон NVRAM-строки без жесткого MAC-адреса
 const NVRAM_TEMPLATE: &[u8] = b"NVRAMRev=$Rev: 7.95.49.00 $\0\
 manfid=0x2d0\0\
 prodid=0x0727\0\
@@ -93,6 +96,7 @@ async fn wifi_stack_task(
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
 
+    // Генерация динамического MAC-адреса
     let seed = embassy_time::Instant::now().as_micros();
     let mac_bytes: [u8; 6] = [
         0x02,
@@ -121,13 +125,14 @@ async fn wifi_stack_task(
         }
 
         nvram_buf[start..start + 17].copy_from_slice(&mac_str);
+        info!(
+            "Динамический MAC-адрес Wi-Fi: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
+        );
     }
 
     static NVRAM_DATA_CELL: StaticCell<Aligned<[u8; 289]>> = StaticCell::new();
     let nvram_data = NVRAM_DATA_CELL.init(Aligned(nvram_buf));
-
-    static CLM_DATA: Aligned<[u8; include_bytes!("firmware/43439A0_clm.bin").len()]> =
-        Aligned(*include_bytes!("firmware/43439A0_clm.bin"));
 
     let fw: &'static cyw43::Aligned<cyw43::A4, [u8]> = unsafe {
         &*(FW_DATA.0.as_slice() as *const [u8] as *const cyw43::Aligned<cyw43::A4, [u8]>)
@@ -227,13 +232,44 @@ async fn http_server_task(stack: Stack<'static>) -> ! {
     let router = picoserve::Router::new()
         .route(
             "/",
-            get(|| async {
-                picoserve::response::json::Json(Telemetry {
-                    temps: crate::state::get_temps(),
-                    rpm: crate::state::get_rpm(),
-                    system_active: crate::state::get_system_active(),
-                })
-            }),
+            picoserve::routing::get_service(picoserve::response::fs::File::html(
+                r#"<!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">
+                    <title>Fan Control TPA3255</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; background: #121212; color: #e0e0e0; }
+                        .card { background: #1e1e1e; padding: 20px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+                        .val { color: #4caf50; font-weight: bold; }
+                    </style>
+                </head>
+                <body>
+                    <div class="card">
+                        <h2>Телеметрия системы</h2>
+                        <p>Вентилятор: <span id="rpm" class="val">--</span> RPM</p>
+                        <p>Датчики 1-6: <span id="temps" class="val">--</span> °C</p>
+                        <p>Статус: <span id="active" class="val">--</span></p>
+                    </div>
+                    <script>
+                        async function updateData() {
+                            try {
+                                let response = await fetch('/telemetry');
+                                let data = await response.json();
+                                document.getElementById('rpm').innerText = data.rpm;
+                                let formattedTemps = data.temps.map(t => (t / 10).toFixed(1)).join(', ');
+                                document.getElementById('temps').innerText = formattedTemps;
+                                document.getElementById('active').innerText = data.system_active ? 'Активен' : 'Остановлен';
+                            } catch (e) {
+                                console.error('Ошибка получения данных', e);
+                            }
+                        }
+                        setInterval(updateData, 1000);
+                        updateData();
+                    </script>
+                </body>
+                </html>"#,
+            )),
         )
         .route(
             "/telemetry",
