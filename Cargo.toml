@@ -37,6 +37,7 @@ codegen-units = 1
 [profile.dev]
 debug = 2
 opt-level = "s"
+overflow-checks = false
 
 [features]
 cyw43 = []
