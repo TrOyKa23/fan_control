@@ -12,6 +12,16 @@ pub static TEMP5: AtomicI32 = AtomicI32::new(0);
 pub static RPM: AtomicU32 = AtomicU32::new(0);
 pub static SYSTEM_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+static FAN_OVERRIDE_SPEED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn set_fan_override(speed: u8) {
+    FAN_OVERRIDE_SPEED.store(speed, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn get_fan_override() -> u8 {
+    FAN_OVERRIDE_SPEED.load(core::sync::atomic::Ordering::Relaxed) as u8
+}
+
 pub fn set_temp(index: usize, temp_deci_c: i16) {
     let v = temp_deci_c as i32;
     match index {

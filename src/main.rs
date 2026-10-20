@@ -121,7 +121,14 @@ async fn main(spawner: Spawner) {
         }
 
         if system_active {
-            let compare_val = fan::calculate_pwm_compare(max_temp_deci_c);
+            let override_speed = crate::state::get_fan_override();
+            let compare_val = if override_speed > 0 {
+                // Переводим проценты (1-100) в значение compare (0 - 5999)
+                ((override_speed as u32 * 5999) / 100) as u16
+            } else {
+                fan::calculate_pwm_compare(max_temp_deci_c)
+            };
+
             pwm_config.compare_b = compare_val;
             fan_pwm.set_config(&pwm_config);
         }

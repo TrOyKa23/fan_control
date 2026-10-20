@@ -7,7 +7,8 @@ use embassy_rp::peripherals::{DMA_CH0, PIN_23, PIN_24, PIN_25, PIN_29, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::Peri;
 use embassy_time::{Duration, Timer};
-use picoserve::routing::get;
+use picoserve::routing::{get, post};
+use serde::Deserialize;
 use serde::Serialize;
 use static_cell::StaticCell;
 
@@ -21,6 +22,11 @@ struct Telemetry {
     temps: [i16; 6],
     rpm: u32,
     system_active: bool,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+struct FanCommand {
+    speed: u8, // 0 - авто, 1..100 - ручная скорость в процентах
 }
 
 // Корректное 4-байтовое выравнивание бинарных прошивок в Flash
@@ -251,7 +257,28 @@ async fn http_server_task(stack: Stack<'static>) -> ! {
                         <p>Датчики 1-6: <span id="temps" class="val">--</span> °C</p>
                         <p>Статус: <span id="active" class="val">--</span></p>
                     </div>
+                    
+                    <div class="card">
+                        <h2>Управление вентилятором</h2>
+                        <p id="mode-text">Режим: Авто</p>
+                        <input type="range" id="fan-slider" min="0" max="100" value="0" oninput="onSliderChange(this.value)">
+                    </div>
+
                     <script>
+                        function onSliderChange(val) {
+                            let modeText = document.getElementById('mode-text');
+                            if (val == 0) {
+                                modeText.innerText = "Режим: Авто";
+                            } else {
+                                modeText.innerText = "Режим: Ручной (" + val + "%)";
+                            }
+                            fetch('/set_fan', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ speed: parseInt(val) })
+                            }).catch(e => console.error('Ошибка отправки', e));
+                        }
+
                         async function updateData() {
                             try {
                                 let response = await fetch('/telemetry');
@@ -279,6 +306,13 @@ async fn http_server_task(stack: Stack<'static>) -> ! {
                     rpm: crate::state::get_rpm(),
                     system_active: crate::state::get_system_active(),
                 })
+            }),
+        )
+        .route(
+            "/set_fan",
+            post(|picoserve::extract::Json(cmd): picoserve::extract::Json<FanCommand>| async move {
+                crate::state::set_fan_override(cmd.speed);
+                "OK"
             }),
         );
 
